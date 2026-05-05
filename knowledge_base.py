@@ -277,29 +277,55 @@ def detect_query_type(question):
 def retrieve_statistics_context(user_question, collection, n_results=3):
     """
     Retrieves the most relevant business documents from ChromaDB.
-    Filters by product ID and document type when detectable.
-    collection is passed as argument so this function is stateless.
+    Tries a strict (product+type) filter first, then progressively looser ones,
+    so we never return empty unless the collection itself is empty.
     """
     product_id = extract_product_id_from_question(user_question)
     doc_type   = detect_query_type(user_question)
+    total      = collection.count()
+    n          = min(n_results, total) if total else 0
 
+    print(f"[rag] question={user_question!r} product_id={product_id} "
+          f"doc_type={doc_type} collection_count={total}", flush=True)
+
+    if total == 0:
+        print("[rag] collection is empty — no documents to retrieve", flush=True)
+        return ''
+
+    # Try filters from strictest to loosest. Stop at the first one that returns docs.
+    filter_attempts = []
     if product_id and doc_type:
-        where = {'$and': [{'product_id': product_id}, {'type': doc_type}]}
-    elif product_id:
-        where = {'product_id': product_id}
-    elif doc_type:
-        where = {'type': doc_type}
-    else:
-        where = None
+        filter_attempts.append({'$and': [{'product_id': product_id}, {'type': doc_type}]})
+    if product_id:
+        filter_attempts.append({'product_id': product_id})
+    if doc_type:
+        filter_attempts.append({'type': doc_type})
+    filter_attempts.append(None)  # no filter — pure semantic search
 
-    results = collection.query(
-        query_texts = [user_question],
-        n_results   = min(n_results, collection.count()),
-        where       = where
-    )
+    docs, metas = [], []
+    for where in filter_attempts:
+        try:
+            results = collection.query(
+                query_texts = [user_question],
+                n_results   = n,
+                where       = where
+            )
+            d = results['documents'][0]
+            m = results['metadatas'][0]
+            print(f"[rag] filter={where} → {len(d)} hits", flush=True)
+            if d:
+                docs, metas = d, m
+                break
+        except Exception as e:
+            print(f"[rag] query failed for filter={where}: {type(e).__name__}: {e}", flush=True)
+
+    if not docs:
+        return ''
 
     context_blocks = [
         f"Metadata: {meta}\nContent:\n{doc}"
-        for doc, meta in zip(results['documents'][0], results['metadatas'][0])
+        for doc, meta in zip(docs, metas)
     ]
-    return '\n\n---\n\n'.join(context_blocks)
+    context = '\n\n---\n\n'.join(context_blocks)
+    print(f"[rag] returning {len(context)} chars of context", flush=True)
+    return context

@@ -1,6 +1,7 @@
 # chatbot.py - Routing, RAG answering, and what-if chat handling for Optima
 
 import json
+import re
 from openai import OpenAI
 from config import OPENAI_MODEL, FIXED_STORE_ID, PRODUCT_NAMES
 from whatif import (
@@ -10,6 +11,29 @@ from whatif import (
     whatif_extended_discount
 )
 from knowledge_base import retrieve_statistics_context
+
+
+def _safe_json_loads(text):
+    """Parse JSON from an LLM response, tolerating ```json ... ``` markdown fences,
+    leading/trailing prose, and other formatting quirks. Returns None on failure."""
+    if not text:
+        return None
+    s = text.strip()
+    # Strip ```json ... ``` or ``` ... ``` fences if present
+    if s.startswith('```'):
+        s = re.sub(r'^```(?:json)?\s*', '', s, flags=re.IGNORECASE)
+        s = re.sub(r'\s*```$', '', s)
+    # Fall back to extracting the first {...} blob if there's surrounding prose
+    try:
+        return json.loads(s)
+    except Exception:
+        m = re.search(r'\{.*\}', s, flags=re.DOTALL)
+        if m:
+            try:
+                return json.loads(m.group(0))
+            except Exception:
+                return None
+        return None
 
 # LLM Setup
 
@@ -69,10 +93,11 @@ Expected JSON:
 }}
 """
     response_text = call_llm(client, prompt)
-    try:
-        return json.loads(response_text)
-    except Exception:
+    parsed = _safe_json_loads(response_text)
+    if parsed is None:
+        print(f"[router] failed to parse LLM response: {response_text!r}", flush=True)
         return {"route": "unknown", "reason": "Failed to parse routing response."}
+    return parsed
 
 
 # What-If Handler
@@ -133,15 +158,15 @@ User question:
 {user_question}
 """
     response_text = call_llm(client, prompt)
-    try:
-        data = json.loads(response_text)
-        if not data or 'scenario' not in data:
-            return None
-        if 'product_id' not in data or 'value' not in data:
-            return None
-        return data
-    except Exception:
+    data = _safe_json_loads(response_text)
+    if data is None:
+        print(f"[whatif-parser] failed to parse LLM response: {response_text!r}", flush=True)
         return None
+    if not data or 'scenario' not in data:
+        return None
+    if 'product_id' not in data or 'value' not in data:
+        return None
+    return data
 
 
 def generate_whatif_llm_response(result, client):
@@ -149,22 +174,72 @@ def generate_whatif_llm_response(result, client):
     Generates a user-friendly business response from what-if result dict.
     """
     prompt = f"""
-You are Optima's business assistant for a fashion retail chain.
+You are Optima's business assistant for a fashion retail chain. Write a SHORT
+conversational explanation of the simulation result below.
 
-Rules:
-- Use simple business language
-- Keep it short and clear
-- Do NOT mention models, code, or technical details
-- Use ONLY the provided numbers
-- Use the product name not the product ID
-- Mention scenario type and key numbers
+CRITICAL OUTPUT RULES:
+- Output PLAIN ENGLISH PROSE ONLY. 2-4 sentences maximum.
+- Do NOT output JSON, do NOT output bullet points, do NOT output markdown.
+- Do NOT echo or repeat the data structure below — translate it into a sentence.
+- Refer to the product by its name (e.g., "the Wedding Dress"), never by ID.
+- Use the actual numbers from the data. Mention SAR for currency.
+- Be honest: if the predicted change is negative, say sales are predicted to DROP.
+- Do NOT mention "model", "prediction", "code", or any technical terms.
 
-Result:
+Simulation data (DO NOT echo this back):
 {json.dumps(result, indent=2)}
 
-Final Answer:
+Now write the 2-4 sentence answer:
 """
-    return call_llm(client, prompt)
+    text = call_llm(client, prompt)
+    # Defensive: if the LLM still echoes JSON, strip code fences and reject obvious echoes
+    s = (text or '').strip()
+    if s.startswith('```'):
+        s = re.sub(r'^```(?:json)?\s*', '', s, flags=re.IGNORECASE)
+        s = re.sub(r'\s*```$', '', s)
+    if s.startswith('{') and s.endswith('}'):
+        # The LLM ignored instructions and returned JSON — synthesize a clean fallback
+        return _summarize_whatif_result(result)
+    return s
+
+
+def _summarize_whatif_result(result):
+    """Code-side fallback summary if the LLM echoes JSON or fails."""
+    name = result.get('product_name', 'the product')
+    scenario = result.get('scenario')
+    if scenario == 'price_change':
+        old_p = result.get('old_price', 0)
+        new_p = result.get('new_price', 0)
+        b = result.get('baseline_sales', 0)
+        n = result.get('new_sales', 0)
+        pct = result.get('difference_pct', 0)
+        direction = 'increase' if pct >= 0 else 'decrease'
+        return (f"Raising the price of {name} from SAR {old_p} to SAR {new_p} is "
+                f"predicted to {direction} weekly sales by {abs(pct):.1f}% "
+                f"(SAR {b:.0f} → SAR {n:.0f}).")
+    if scenario == 'discount_change':
+        old_d = result.get('old_discount_pct', 0)
+        new_d = result.get('new_discount_pct', 0)
+        b = result.get('baseline_sales', 0)
+        n = result.get('new_sales', 0)
+        pct = result.get('difference_pct', 0)
+        direction = 'increase' if pct >= 0 else 'decrease'
+        return (f"Changing the discount on {name} from {old_d}% to {new_d}% is "
+                f"predicted to {direction} weekly sales by {abs(pct):.1f}% "
+                f"(SAR {b:.0f} → SAR {n:.0f}).")
+    if scenario == 'extended_discount':
+        d = result.get('discount_pct', 0)
+        sm = result.get('start_month', '')
+        em = result.get('end_month', '')
+        total = result.get('total', {}) or {}
+        b = total.get('baseline_sales', 0)
+        n = total.get('new_sales', 0)
+        pct = total.get('delta_pct', 0)
+        direction = 'increase' if pct >= 0 else 'decrease'
+        return (f"Running a {d}% discount on {name} from {sm} to {em} is "
+                f"predicted to {direction} total sales by {abs(pct):.1f}% over the "
+                f"period (SAR {b:.0f} → SAR {n:.0f}).")
+    return "Simulation completed. See the chart for the predicted impact."
 
 
 def handle_whatif_question(user_question, client):
@@ -228,8 +303,12 @@ def answer_statistics_rag_question(user_question, collection, client):
     """
     context = retrieve_statistics_context(user_question, collection)
 
-    if not context or len(context.strip()) < 50:
-        return "Sorry, the available data is not sufficient to answer this question."
+    # The retrieve function already falls back through looser filters; an empty
+    # result here means the ChromaDB collection itself is empty.
+    if not context or not context.strip():
+        return ("I couldn't find any business documents in the knowledge base. "
+                "Try restarting the backend so the documents are regenerated, "
+                "or check that the data files are reachable.")
 
     prompt = f"""
 You are Optima's business analytics chatbot.

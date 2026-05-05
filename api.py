@@ -1,6 +1,7 @@
 # api.py - FastAPI endpoints for the Optima DSS
 
 import os
+import traceback
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -19,6 +20,7 @@ from whatif import (
 from knowledge_base import (
     setup_chromadb,
     load_documents,
+    save_documents,
     generate_documents_with_llm
 )
 from chatbot import create_llm_client, call_llm, chat
@@ -37,27 +39,54 @@ app.add_middleware(
     allow_headers     = ["*"],
 )
 
-# Serve the interface folder as static files
-app.mount("/interface", StaticFiles(directory="interface"), name="interface")
+# Serve the interface folder as static files (only if it exists — the React
+# frontend is now a separate project, so this is optional).
+import os
+if os.path.isdir("interface"):
+    app.mount("/interface", StaticFiles(directory="interface"), name="interface")
 
 # Load data, model, LLM client, and ChromaDB on startup
 train_data, model, product_avg_price, pr_min, pr_max = load_all()
 llm_client = create_llm_client(OPENAI_API_KEY)
 
-# Load or generate RAG documents
+# Load or generate RAG documents.
+# Validate that loaded documents reference the CURRENT PRODUCT_IDS — otherwise
+# the RAG retrieval would return stale or empty results for current queries.
+def _docs_match_current_products(metadatas):
+    if not metadatas:
+        return False
+    seen_pids = {
+        m.get('product_id')
+        for m in metadatas
+        if isinstance(m, dict) and m.get('product_id') is not None
+    }
+    # Require at least one document per current product
+    return all(pid in seen_pids for pid in PRODUCT_IDS)
+
+documents, metadatas, ids = [], [], []
 try:
     documents, metadatas, ids = load_documents()
-    print("✓ Loaded documents from backup")
+    if _docs_match_current_products(metadatas):
+        print(f"✓ Loaded {len(documents)} documents from backup (matches current products)")
+    else:
+        print("⚠ Loaded documents do not cover current PRODUCT_IDS — regenerating...")
+        documents, metadatas, ids = [], [], []
+        raise FileNotFoundError
 except FileNotFoundError:
-    print("No backup found — generating documents...")
+    print("No usable backup found — generating documents (this calls the LLM, may take ~30s)...")
     documents, metadatas, ids = generate_documents_with_llm(
         train_data   = train_data,
         store_id     = FIXED_STORE_ID,
         product_ids  = PRODUCT_IDS,
         call_llm     = lambda p: call_llm(llm_client, p)
     )
+    try:
+        save_documents(documents, metadatas, ids)
+    except Exception as e:
+        print(f"⚠ Could not save documents backup: {e}")
 
 collection = setup_chromadb(documents, metadatas, ids)
+print(f"✓ ChromaDB ready with {collection.count()} documents")
 
 # Request Models
 
@@ -94,6 +123,17 @@ def get_products():
     ]
 
 
+def _log_and_raise(e, code=500):
+    """Print the full traceback to the uvicorn console so we can debug,
+    and surface the error type + message in the HTTP response."""
+    tb = traceback.format_exc()
+    print("\n" + "=" * 70, flush=True)
+    print(f"[ERROR] {type(e).__name__}: {e}", flush=True)
+    print(tb, flush=True)
+    print("=" * 70 + "\n", flush=True)
+    raise HTTPException(status_code=code, detail=f"{type(e).__name__}: {e}")
+
+
 @app.post("/whatif/price")
 def price_change(req: PriceChangeRequest):
     """Simulates a price increase for a product."""
@@ -104,7 +144,7 @@ def price_change(req: PriceChangeRequest):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        _log_and_raise(e)
 
 
 @app.post("/whatif/discount")
@@ -122,7 +162,7 @@ def discount_change(req: DiscountChangeRequest):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        _log_and_raise(e)
 
 
 @app.post("/whatif/extended")
@@ -150,7 +190,7 @@ def extended_discount(req: ExtendedDiscountRequest):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        _log_and_raise(e)
 
 
 @app.post("/chat")
@@ -171,4 +211,4 @@ def chat_endpoint(req: ChatRequest):
             "route":  route
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        _log_and_raise(e)
