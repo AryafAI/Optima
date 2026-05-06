@@ -2,6 +2,7 @@
 
 import os
 import traceback
+import pandas as pd
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -116,11 +117,98 @@ def root():
 
 @app.get("/products")
 def get_products():
-    """Returns list of available products for the dropdown."""
-    return [
-        {"id": pid, "name": PRODUCT_NAMES[pid]}
-        for pid in PRODUCT_IDS
-    ]
+    """
+    Returns list of available products with their current selling price
+    (from the most recent week of training data for each product).
+    """
+    out = []
+    for pid in PRODUCT_IDS:
+        try:
+            baseline, _ = get_latest_baseline(FIXED_STORE_ID, pid)
+            current_price = round(float(baseline.get('Avg_Price', 0.0)), 2)
+        except Exception:
+            current_price = None
+        out.append({
+            "id":            int(pid),
+            "name":          PRODUCT_NAMES[pid],
+            "current_price": current_price,
+        })
+    return out
+
+
+@app.get("/overview")
+def get_overview():
+    """
+    Returns the dashboard KPI overview computed from the latest 4 weeks
+    of training data for the selected products at the fixed store:
+        - total_quantity_sold
+        - total_sales
+        - total_profit  (sales − production cost*quantity, with a fallback)
+        - top_product   (the product with the highest sales over those 4 weeks)
+    """
+    try:
+        df = train_data[
+            (train_data['Store ID']   == FIXED_STORE_ID) &
+            (train_data['Product ID'].isin(PRODUCT_IDS))
+        ].copy()
+
+        if 'Week_Start' in df.columns:
+            df['Week_Start'] = pd.to_datetime(df['Week_Start'], errors='coerce')
+
+        # Keep latest 4 rows per product (most recent weeks)
+        sort_col = 'Week_Start' if 'Week_Start' in df.columns else None
+        if sort_col:
+            df = df.sort_values(sort_col, ascending=False)
+        latest = df.groupby('Product ID', as_index=False).head(4)
+
+        total_sales    = float(latest['Weekly_Sales'].sum())
+
+        # Quantity column is named differently across snapshots — try them in order
+        qty_col = next(
+            (c for c in ['Quantity', 'Weekly_Quantity', 'Units_Sold', 'Lag1_Quantity']
+             if c in latest.columns),
+            None
+        )
+        if qty_col is not None:
+            total_quantity = int(latest[qty_col].sum())
+        else:
+            # Fall back: derive units from sales / avg_price
+            with_price = latest[latest['Avg_Price'] > 0]
+            total_quantity = int((with_price['Weekly_Sales'] / with_price['Avg_Price']).sum())
+
+        # Profit = sales − production cost × quantity, where Production Cost is per unit
+        prod_cost_col = 'Production Cost' if 'Production Cost' in latest.columns else None
+        if prod_cost_col and qty_col:
+            total_cost   = float((latest[prod_cost_col] * latest[qty_col]).sum())
+            total_profit = total_sales - total_cost
+        elif prod_cost_col:
+            # Approximate quantity from price when no quantity column
+            with_price = latest[latest['Avg_Price'] > 0].copy()
+            with_price['_qty'] = with_price['Weekly_Sales'] / with_price['Avg_Price']
+            total_cost   = float((with_price[prod_cost_col] * with_price['_qty']).sum())
+            total_profit = total_sales - total_cost
+        else:
+            total_profit = total_sales  # production cost not available; show sales as profit floor
+
+        # Top product by total sales over the latest 4 weeks
+        per_product = latest.groupby('Product ID')['Weekly_Sales'].sum().sort_values(ascending=False)
+        top_pid     = int(per_product.index[0])
+        top_sales   = float(per_product.iloc[0])
+
+        return {
+            "total_quantity_sold": total_quantity,
+            "total_sales":         round(total_sales,  2),
+            "total_profit":        round(total_profit, 2),
+            "top_product": {
+                "id":    top_pid,
+                "name":  PRODUCT_NAMES.get(top_pid, f"Product {top_pid}"),
+                "sales": round(top_sales, 2),
+            },
+            "weeks_used": int(latest.groupby('Product ID').size().max()),
+            "products":   [int(p) for p in PRODUCT_IDS],
+        }
+    except Exception as e:
+        _log_and_raise(e)
 
 
 def _log_and_raise(e, code=500):

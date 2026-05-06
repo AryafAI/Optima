@@ -245,6 +245,23 @@ def detect_query_type(question):
     """Detects the most relevant document type for this question."""
     q = question.lower().strip()
 
+    # Top/best-selling product comparisons must be checked BEFORE the generic
+    # product_summary keywords below, so questions like "what is the best
+    # selling product?" route to the dedicated product_comparison document
+    # (which has top vs bottom by revenue) instead of returning a noisy
+    # mix of unrelated summaries.
+    if any(p in q for p in [
+        'best selling', 'best-selling', 'top selling', 'top-selling',
+        'highest selling', 'most sold', 'most popular', 'top performer',
+        'top performing product',
+    ]):
+        return 'product_comparison'
+
+    if any(w in q for w in ['compare', 'comparison', 'versus',
+                             'vs', 'higher than', 'lower than',
+                             'rank', 'ranking', 'which product is']):
+        return 'product_comparison'
+
     if 'total revenue' in q:
         return 'product_summary'
 
@@ -263,10 +280,6 @@ def detect_query_type(question):
                              'in september', 'in october', 'in november',
                              'in december', 'sales in', 'revenue in']):
         return 'monthly_breakdown'
-
-    if any(w in q for w in ['compare', 'comparison', 'versus',
-                             'vs', 'higher than', 'lower than']):
-        return 'product_comparison'
 
     if any(w in q for w in ['overall store', 'store performance', 'store revenue']):
         return 'store_monthly_insights'

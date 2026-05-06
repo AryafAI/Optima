@@ -173,72 +173,228 @@ def generate_whatif_llm_response(result, client):
     """
     Generates a user-friendly business response from what-if result dict.
     """
+    # Re-shape the result so every numeric field is unambiguously labeled with its
+    # unit. The chart already renders the raw numbers — the LLM just narrates them.
+    annotated = _annotate_units(result)
+
     prompt = f"""
-You are Optima's business assistant for a fashion retail chain. Write a SHORT
-conversational explanation of the simulation result below.
+You are Optima's business assistant for a fashion retail chain. Write a clear
+business answer about the simulation result below in EXACTLY THREE PARAGRAPHS,
+separated by blank lines.
 
-CRITICAL OUTPUT RULES:
-- Output PLAIN ENGLISH PROSE ONLY. 2-4 sentences maximum.
-- Do NOT output JSON, do NOT output bullet points, do NOT output markdown.
-- Do NOT echo or repeat the data structure below — translate it into a sentence.
+REQUIRED FORMAT (follow this exactly — three paragraphs, blank line between each):
+
+Paragraph 1 — describe what the scenario is, naming the product and the
+specific change. Mention the actual SAR values involved (old and new price, or
+old and new discount). Mention whether this is expected to grow or shrink sales.
+1–2 sentences.
+
+[blank line]
+
+Paragraph 2 — give the sales numbers. Write something like:
+"We're now expecting sales to rise from <baseline> SAR to <predicted> SAR,
+reflecting an increase of <pct>%."  (or "drop" / "decrease" if pct is negative).
+1 sentence.
+
+[blank line]
+
+Paragraph 3 — a short business conclusion. What does this mean for the store?
+Examples: "customers are still willing to purchase the dress despite the higher
+price", or "the discount may be too aggressive given the predicted drop". 1–2 sentences.
+
+STRICT RULES:
+- Output the three paragraphs ONLY, separated by blank lines.
+- Do NOT output bullet points. Do NOT output headers. Do NOT output JSON.
+- Do NOT echo the data dict back. Translate it into prose.
 - Refer to the product by its name (e.g., "the Wedding Dress"), never by ID.
-- Use the actual numbers from the data. Mention SAR for currency.
-- Be honest: if the predicted change is negative, say sales are predicted to DROP.
-- Do NOT mention "model", "prediction", "code", or any technical terms.
 
-Simulation data (DO NOT echo this back):
-{json.dumps(result, indent=2)}
+UNIT RULES (very important):
+- Every monetary field ends in "_sar" and represents SAR (Saudi riyals), NEVER units.
+- The dataset has NO unit/quantity column — never say "units", "items sold",
+  "pieces" or similar. Every sales value MUST be written as "SAR <amount>".
+- Numbers ending in "_pct" are percentages.
 
-Now write the 2-4 sentence answer:
+Be honest: if difference_pct or delta_pct is negative, the entire tone of all three
+paragraphs should reflect a predicted DROP in sales (not growth).
+Do NOT mention "model", "prediction", "code", or any technical terms.
+
+Simulation data (translate this into the three-paragraph format above):
+{json.dumps(annotated, indent=2)}
+
+Now write the answer:
 """
     text = call_llm(client, prompt)
-    # Defensive: if the LLM still echoes JSON, strip code fences and reject obvious echoes
+    # Defensive layer: if the LLM echoes JSON, uses wrong units, or fails to
+    # produce three paragraphs, fall back to the deterministic summarizer so
+    # the user always sees the same clean shape.
     s = (text or '').strip()
     if s.startswith('```'):
         s = re.sub(r'^```(?:json)?\s*', '', s, flags=re.IGNORECASE)
         s = re.sub(r'\s*```$', '', s)
     if s.startswith('{') and s.endswith('}'):
-        # The LLM ignored instructions and returned JSON — synthesize a clean fallback
         return _summarize_whatif_result(result)
-    return s
+    if _looks_like_unit_confusion(s):
+        print(f"[whatif-llm] LLM mentioned units — falling back to deterministic summary. raw={s!r}",
+              flush=True)
+        return _summarize_whatif_result(result)
+    # Strip stray bullets if the LLM added them despite the prompt — we want
+    # plain prose paragraphs only.
+    s = re.sub(r'^\s*[•·\-\*]\s*', '', s, flags=re.MULTILINE)
+    # Require at least 3 paragraphs (i.e., 2 blank-line separators). If the LLM
+    # returned a wall of text or only two paragraphs, fall back to the
+    # deterministic three-paragraph version.
+    paragraphs = [p.strip() for p in re.split(r'\n\s*\n', s) if p.strip()]
+    if len(paragraphs) < 3:
+        print(f"[whatif-llm] LLM returned {len(paragraphs)} paragraph(s); using structured fallback.",
+              flush=True)
+        return _summarize_whatif_result(result)
+    return '\n\n'.join(paragraphs[:3])
+
+
+def _annotate_units(result):
+    """Return a copy of the result dict with `_sar`/`_pct` suffixes on numeric
+    fields so the LLM cannot confuse currency for unit counts."""
+    if not isinstance(result, dict):
+        return result
+    rename_map = {
+        'old_price':       'old_price_sar',
+        'new_price':       'new_price_sar',
+        'price_increase':  'price_increase_sar',
+        'baseline_sales':  'baseline_sales_sar',
+        'new_sales':       'new_sales_sar',
+        'difference':      'difference_sar',
+    }
+    out = {}
+    for k, v in result.items():
+        if isinstance(v, dict):
+            out[k] = _annotate_units(v)
+        elif isinstance(v, list):
+            out[k] = [_annotate_units(x) if isinstance(x, dict) else x for x in v]
+        else:
+            out[rename_map.get(k, k)] = v
+    return out
+
+
+def _looks_like_unit_confusion(text):
+    """Detect when the LLM described monetary sales as discrete units."""
+    if not text:
+        return False
+    t = text.lower()
+    # A sentence is suspect if it pairs a sales-related noun with "units" / "items" /
+    # "pieces" — without "SAR" anywhere nearby.
+    bad_terms = ['units', 'items sold', 'pieces sold', 'pcs', 'unit sales']
+    if any(term in t for term in bad_terms) and 'sar' not in t:
+        return True
+    return False
 
 
 def _summarize_whatif_result(result):
-    """Code-side fallback summary if the LLM echoes JSON or fails."""
-    name = result.get('product_name', 'the product')
+    """Code-side three-paragraph fallback. Used when the LLM misbehaves or
+    fails to produce the right shape. Mirrors the prompt template in
+    generate_whatif_llm_response above. Edit the f-strings below to change
+    the deterministic answer text."""
+    name     = result.get('product_name', 'the product')
     scenario = result.get('scenario')
+
+    def _verb(pct, growing, dropping):
+        return growing if pct >= 0 else dropping
+
+    def _conclusion_price(pct, name):
+        if pct >= 3:
+            return (f"This change suggests that customers are still willing to "
+                    f"purchase the {name} despite the higher price.")
+        if pct > 0:
+            return (f"The {name} appears mostly resilient to the higher price, "
+                    f"but the upside is small.")
+        if pct >= -3:
+            return (f"The {name} loses a small amount of weekly sales at the "
+                    f"new price — worth monitoring before committing.")
+        return (f"Customers appear sensitive to the higher price for the {name}, "
+                f"so this increase is risky and should be reviewed.")
+
+    def _conclusion_discount(pct, name):
+        if pct >= 3:
+            return (f"The deeper discount appears to drive enough additional "
+                    f"weekly sales of the {name} to be worthwhile.")
+        if pct > 0:
+            return (f"The discount lifts {name} sales only slightly — its "
+                    f"margin impact may not justify the change.")
+        if pct >= -3:
+            return (f"The discount produces little uplift for the {name}; the "
+                    f"price reduction is likely cutting into margin without "
+                    f"meaningful volume growth.")
+        return (f"The discount is predicted to actually shrink revenue for the "
+                f"{name}; consider keeping the current pricing.")
+
+    def _conclusion_extended(pct, name):
+        if pct >= 3:
+            return (f"Running this campaign across the selected period looks "
+                    f"effective for the {name} and should grow total sales.")
+        if pct > 0:
+            return (f"The campaign produces a small uplift for the {name} — "
+                    f"weigh it against the lost margin before launching.")
+        if pct >= -3:
+            return (f"The campaign barely moves total sales for the {name}; "
+                    f"the discount may not be worth the margin sacrifice.")
+        return (f"This extended discount is predicted to reduce total revenue "
+                f"for the {name}; review the campaign before launching.")
+
     if scenario == 'price_change':
-        old_p = result.get('old_price', 0)
-        new_p = result.get('new_price', 0)
-        b = result.get('baseline_sales', 0)
-        n = result.get('new_sales', 0)
-        pct = result.get('difference_pct', 0)
-        direction = 'increase' if pct >= 0 else 'decrease'
-        return (f"Raising the price of {name} from SAR {old_p} to SAR {new_p} is "
-                f"predicted to {direction} weekly sales by {abs(pct):.1f}% "
-                f"(SAR {b:.0f} → SAR {n:.0f}).")
+        old_p     = result.get('old_price', 0)
+        new_p     = result.get('new_price', 0)
+        b         = result.get('baseline_sales', 0)
+        n         = result.get('new_sales', 0)
+        pct       = result.get('difference_pct', 0)
+        verb_para1 = _verb(pct, "a boost", "a drop")
+        verb_para2 = _verb(pct, "rise",   "drop")
+        verb_pct   = _verb(pct, "increase", "decrease")
+        sign_pct   = abs(pct)
+        para1 = (f"The {name} is seeing a price increase from {old_p:.2f} SAR "
+                 f"to {new_p:.2f} SAR, which has led to {verb_para1} in weekly sales.")
+        para2 = (f"We're now expecting sales to {verb_para2} from {b:.2f} SAR "
+                 f"to {n:.2f} SAR, reflecting a{('n' if verb_pct[0] in 'aeiou' else '')} "
+                 f"{verb_pct} of {sign_pct:.1f}%.")
+        para3 = _conclusion_price(pct, name)
+        return f"{para1}\n\n{para2}\n\n{para3}"
+
     if scenario == 'discount_change':
-        old_d = result.get('old_discount_pct', 0)
-        new_d = result.get('new_discount_pct', 0)
-        b = result.get('baseline_sales', 0)
-        n = result.get('new_sales', 0)
-        pct = result.get('difference_pct', 0)
-        direction = 'increase' if pct >= 0 else 'decrease'
-        return (f"Changing the discount on {name} from {old_d}% to {new_d}% is "
-                f"predicted to {direction} weekly sales by {abs(pct):.1f}% "
-                f"(SAR {b:.0f} → SAR {n:.0f}).")
+        old_d     = result.get('old_discount_pct', 0)
+        new_d     = result.get('new_discount_pct', 0)
+        b         = result.get('baseline_sales', 0)
+        n         = result.get('new_sales', 0)
+        pct       = result.get('difference_pct', 0)
+        verb_para2 = _verb(pct, "rise", "drop")
+        verb_pct   = _verb(pct, "increase", "decrease")
+        sign_pct   = abs(pct)
+        para1 = (f"The discount on the {name} is changing from {old_d:.0f}% "
+                 f"to {new_d:.0f}%, which is expected to "
+                 f"{_verb(pct, 'lift', 'reduce')} weekly sales.")
+        para2 = (f"We're now expecting sales to {verb_para2} from {b:.2f} SAR "
+                 f"to {n:.2f} SAR, reflecting a{('n' if verb_pct[0] in 'aeiou' else '')} "
+                 f"{verb_pct} of {sign_pct:.1f}%.")
+        para3 = _conclusion_discount(pct, name)
+        return f"{para1}\n\n{para2}\n\n{para3}"
+
     if scenario == 'extended_discount':
-        d = result.get('discount_pct', 0)
-        sm = result.get('start_month', '')
-        em = result.get('end_month', '')
-        total = result.get('total', {}) or {}
-        b = total.get('baseline_sales', 0)
-        n = total.get('new_sales', 0)
-        pct = total.get('delta_pct', 0)
-        direction = 'increase' if pct >= 0 else 'decrease'
-        return (f"Running a {d}% discount on {name} from {sm} to {em} is "
-                f"predicted to {direction} total sales by {abs(pct):.1f}% over the "
-                f"period (SAR {b:.0f} → SAR {n:.0f}).")
+        d         = result.get('discount_pct', 0)
+        sm        = result.get('start_month', '')
+        em        = result.get('end_month', '')
+        total     = result.get('total', {}) or {}
+        b         = total.get('baseline_sales', 0)
+        n         = total.get('new_sales', 0)
+        pct       = total.get('delta_pct', 0)
+        verb_para2 = _verb(pct, "rise", "drop")
+        verb_pct   = _verb(pct, "increase", "decrease")
+        sign_pct   = abs(pct)
+        para1 = (f"Running a {d:.0f}% discount on the {name} from {sm} to "
+                 f"{em} is expected to {_verb(pct, 'lift', 'reduce')} total sales.")
+        para2 = (f"We're now expecting total sales to {verb_para2} from "
+                 f"{b:.2f} SAR to {n:.2f} SAR over the period, reflecting "
+                 f"a{('n' if verb_pct[0] in 'aeiou' else '')} {verb_pct} of "
+                 f"{sign_pct:.1f}%.")
+        para3 = _conclusion_extended(pct, name)
+        return f"{para1}\n\n{para2}\n\n{para3}"
+
     return "Simulation completed. See the chart for the predicted impact."
 
 
