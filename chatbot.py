@@ -184,10 +184,22 @@ separated by blank lines.
 
 REQUIRED FORMAT (follow this exactly — three paragraphs, blank line between each):
 
-Paragraph 1 — describe what the scenario is, naming the product and the
-specific change. Mention the actual SAR values involved (old and new price, or
-old and new discount). Mention whether this is expected to grow or shrink sales.
-1–2 sentences.
+Paragraph 1 — describe what is happening directly. Start with the product name
+and the change itself. Mention the actual SAR values involved (old and new
+price, or old and new discount). Mention whether this is expected to grow or
+shrink sales. 1–2 sentences.
+
+GOOD opening examples for paragraph 1:
+- "The Wedding Dress is seeing a price increase from SAR 56.5 to SAR 66.5..."
+- "The discount on the Party Dress is changing from 25% to 35%..."
+- "Running a 45% discount on the Graduation Dress from March to May..."
+
+BAD opening examples — DO NOT START LIKE THESE:
+- "In this scenario, we are examining..."
+- "This scenario explores..."
+- "Let's analyze the impact of..."
+- "We're looking at what happens when..."
+- "This analysis shows..."
 
 [blank line]
 
@@ -207,6 +219,9 @@ STRICT RULES:
 - Do NOT output bullet points. Do NOT output headers. Do NOT output JSON.
 - Do NOT echo the data dict back. Translate it into prose.
 - Refer to the product by its name (e.g., "the Wedding Dress"), never by ID.
+- Do NOT start with meta-phrases like "In this scenario", "This scenario",
+  "Let's", "We are examining", "This analysis", "The simulation shows" — open
+  paragraph 1 with the product name itself.
 
 UNIT RULES (very important):
 - Every monetary field ends in "_sar" and represents SAR (Saudi riyals), NEVER units.
@@ -248,7 +263,35 @@ Now write the answer:
         print(f"[whatif-llm] LLM returned {len(paragraphs)} paragraph(s); using structured fallback.",
               flush=True)
         return _summarize_whatif_result(result)
+    # Drop any leading meta-explanation sentence. If paragraph 1 starts with
+    # "In this scenario", "We are examining", "Let's analyze", etc., remove just
+    # that opening sentence — keep the rest of the paragraph if there is more.
+    paragraphs[0] = _strip_meta_opening(paragraphs[0])
+    if not paragraphs[0]:
+        # Whole paragraph 1 was meta — drop it and promote 2 & 3.
+        paragraphs = paragraphs[1:]
+        if len(paragraphs) < 3:
+            return _summarize_whatif_result(result)
     return '\n\n'.join(paragraphs[:3])
+
+
+_META_OPENING_PATTERNS = [
+    r'^\s*in\s+this\s+scenario[^.]*\.\s*',
+    r'^\s*this\s+scenario[^.]*\.\s*',
+    r'^\s*let[\'s]+\s+(analyze|examine|look)[^.]*\.\s*',
+    r'^\s*we[\'re]*\s+(examining|looking\s+at|analyzing)[^.]*\.\s*',
+    r'^\s*this\s+analysis[^.]*\.\s*',
+    r'^\s*the\s+simulation\s+shows[^.]*\.\s*',
+    r'^\s*here[\'s]?\s+(an?\s+)?(analysis|breakdown)[^.]*\.\s*',
+]
+
+def _strip_meta_opening(paragraph):
+    """Remove a leading meta-explanation sentence ("In this scenario, ...") if
+    present. Leaves the rest of the paragraph intact."""
+    out = paragraph
+    for pat in _META_OPENING_PATTERNS:
+        out = re.sub(pat, '', out, count=1, flags=re.IGNORECASE)
+    return out.strip()
 
 
 def _annotate_units(result):
