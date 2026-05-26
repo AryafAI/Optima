@@ -2,8 +2,9 @@
 
 import json
 import re
+import difflib
 from openai import OpenAI
-from config import OPENAI_MODEL, FIXED_STORE_ID, PRODUCT_NAMES
+from config import OPENAI_MODEL, FIXED_STORE_ID, PRODUCT_NAMES, VALID_DISCOUNTS, MONTH_NAMES
 from whatif import (
     get_latest_baseline,
     whatif_price_change,
@@ -14,16 +15,13 @@ from knowledge_base import retrieve_statistics_context
 
 
 def _safe_json_loads(text):
-    """Parse JSON from an LLM response, tolerating ```json ... ``` markdown fences,
-    leading/trailing prose, and other formatting quirks. Returns None on failure."""
+    """Parse JSON from an LLM response, Returns None on failure."""
     if not text:
         return None
     s = text.strip()
-    # Strip ```json ... ``` or ``` ... ``` fences if present
     if s.startswith('```'):
         s = re.sub(r'^```(?:json)?\s*', '', s, flags=re.IGNORECASE)
         s = re.sub(r'\s*```$', '', s)
-    # Fall back to extracting the first {...} blob if there's surrounding prose
     try:
         return json.loads(s)
     except Exception:
@@ -36,7 +34,6 @@ def _safe_json_loads(text):
         return None
 
 # LLM Setup
-
 def create_llm_client(api_key):
     """Creates and returns an OpenAI client."""
     return OpenAI(api_key=api_key)
@@ -104,54 +101,53 @@ Expected JSON:
 
 def parse_whatif_parameters(user_question, client):
     """
-    Extracts what-if parameters from the user question using LLM.
-    Supports: price_change, discount_change, extended_discount
+    Extracts what-if scenario parameters from the user question using the LLM.
+    Always returns a dict with the five keys below (missing values are None) so
+    the caller can give a SPECIFIC, helpful error. Returns None only when the
+    LLM response is completely unreadable.
+    Supports: price_change, discount_change, extended_discount.
     """
     prompt = f"""
 You are extracting structured what-if scenario parameters
 for a retail decision support system.
 
 Supported scenarios:
-1. price_change — user wants to increase price by a SAR amount
-2. discount_change — user wants to apply a discount rate
-3. extended_discount — user wants to apply a discount over multiple months
+1. price_change - the user wants to RAISE the selling price by a SAR amount.
+2. discount_change - the user wants to apply ONE discount rate (no months).
+3. extended_discount - the user wants a discount applied across a RANGE of
+   months (two or more months, or a "for N months" period).
 
-Rules:
-- Return ONLY valid JSON
-- No explanation
-- Discount must be decimal format (25% -> 0.25)
-- Only valid discount values: 0, 0.25, 0.35, 0.45
-- price_change value is always a positive SAR amount to ADD to current price
-- For extended_discount include start_month and end_month as integers (1-12)
-- MUST include: scenario, product_id, value
-- If missing info, return empty JSON: {{}}
+How to choose the scenario:
+- If the user mentions a month range, two months, a season, a quarter, or any
+  multi-month period in ANY wording, choose "extended_discount" - even if the
+  word "extend" is NOT used. These are ALL extended_discount:
+  "from March to May", "between March and May", "March through May",
+  "for 3 months", "during spring", "over Q2", "apply 25% Jan to April".
+- A discount with no month range is "discount_change".
+- Raising the price is "price_change".
+
+Extraction rules:
+- Return ONLY valid JSON. No explanation, no markdown.
+- ALWAYS return the JSON object shown below. If a field is missing or unclear,
+  set it to null - do NOT drop the field and do NOT return an empty object.
+- "product_id": map the product name to its ID using the mapping below; match
+  even if the name is slightly misspelled. If you truly cannot tell, use null.
+- "value": for price_change a positive SAR number to ADD to the price; for
+  discount_change / extended_discount the discount as a decimal (25% -> 0.25).
+  Return the number the user actually said even if it is unusual - do NOT round
+  it, do NOT reject it, do NOT replace it. If absent, use null.
+- "start_month" / "end_month": integers 1-12 for extended_discount, else null.
 
 Product name to ID mapping:
 {json.dumps({v: k for k, v in PRODUCT_NAMES.items()}, indent=2)}
 
-Expected JSON examples:
-
-Price change:
+Always return EXACTLY this shape:
 {{
-  "scenario": "price_change",
-  "product_id": 8999,
-  "value": 10
-}}
-
-Discount change:
-{{
-  "scenario": "discount_change",
-  "product_id": 12717,
-  "value": 0.25
-}}
-
-Extended discount:
-{{
-  "scenario": "extended_discount",
-  "product_id": 10013,
-  "value": 0.45,
-  "start_month": 3,
-  "end_month": 5
+  "scenario": "price_change" | "discount_change" | "extended_discount" | null,
+  "product_id": <int or null>,
+  "value": <number or null>,
+  "start_month": <int 1-12 or null>,
+  "end_month": <int 1-12 or null>
 }}
 
 User question:
@@ -159,14 +155,18 @@ User question:
 """
     response_text = call_llm(client, prompt)
     data = _safe_json_loads(response_text)
-    if data is None:
+    if not isinstance(data, dict):
         print(f"[whatif-parser] failed to parse LLM response: {response_text!r}", flush=True)
         return None
-    if not data or 'scenario' not in data:
-        return None
-    if 'product_id' not in data or 'value' not in data:
-        return None
-    return data
+    # Normalise: guarantee all five keys exist so the caller can inspect each
+    # one and produce a specific message about whatever is missing or wrong.
+    return {
+        'scenario':    data.get('scenario'),
+        'product_id':  data.get('product_id'),
+        'value':       data.get('value'),
+        'start_month': data.get('start_month'),
+        'end_month':   data.get('end_month'),
+    }
 
 
 def generate_whatif_llm_response(result, client):
@@ -174,7 +174,7 @@ def generate_whatif_llm_response(result, client):
     Generates a user-friendly business response from what-if result dict.
     """
     # Re-shape the result so every numeric field is unambiguously labeled with its
-    # unit. The chart already renders the raw numbers — the LLM just narrates them.
+    # unit. The chart already renders the raw numbers - the LLM just narrates them.
     annotated = _annotate_units(result)
 
     prompt = f"""
@@ -182,19 +182,19 @@ You are Optima's business assistant for a fashion retail chain. Write a clear
 business answer about the simulation result below in EXACTLY THREE PARAGRAPHS,
 separated by blank lines.
 
-REQUIRED FORMAT (follow this exactly — three paragraphs, blank line between each):
+REQUIRED FORMAT (follow this exactly - three paragraphs, blank line between each):
 
-Paragraph 1 — describe what is happening directly. Start with the product name
+Paragraph 1 - describe what is happening directly. Start with the product name
 and the change itself. Mention the actual SAR values involved (old and new
 price, or old and new discount). Mention whether this is expected to grow or
-shrink sales. 1–2 sentences.
+shrink sales. 1-2 sentences.
 
 GOOD opening examples for paragraph 1:
 - "The Wedding Dress is seeing a price increase from SAR 56.5 to SAR 66.5..."
 - "The discount on the Party Dress is changing from 25% to 35%..."
 - "Running a 45% discount on the Graduation Dress from March to May..."
 
-BAD opening examples — DO NOT START LIKE THESE:
+BAD opening examples - DO NOT START LIKE THESE:
 - "In this scenario, we are examining..."
 - "This scenario explores..."
 - "Let's analyze the impact of..."
@@ -203,14 +203,14 @@ BAD opening examples — DO NOT START LIKE THESE:
 
 [blank line]
 
-Paragraph 2 — give the sales numbers. Write something like:
+Paragraph 2 - give the sales numbers. Write something like:
 "We're now expecting sales to rise from <baseline> SAR to <predicted> SAR,
 reflecting an increase of <pct>%."  (or "drop" / "decrease" if pct is negative).
 1 sentence.
 
 [blank line]
 
-Paragraph 3 — a short business conclusion. What does this mean for the store?
+Paragraph 3 - a short business conclusion. What does this mean for the store?
 Examples: "customers are still willing to purchase the dress despite the higher
 price", or "the discount may be too aggressive given the predicted drop". 1–2 sentences.
 
@@ -220,12 +220,12 @@ STRICT RULES:
 - Do NOT echo the data dict back. Translate it into prose.
 - Refer to the product by its name (e.g., "the Wedding Dress"), never by ID.
 - Do NOT start with meta-phrases like "In this scenario", "This scenario",
-  "Let's", "We are examining", "This analysis", "The simulation shows" — open
+  "Let's", "We are examining", "This analysis", "The simulation shows" - open
   paragraph 1 with the product name itself.
 
 UNIT RULES (very important):
 - Every monetary field ends in "_sar" and represents SAR (Saudi riyals), NEVER units.
-- The dataset has NO unit/quantity column — never say "units", "items sold",
+- The dataset has NO unit/quantity column - never say "units", "items sold",
   "pieces" or similar. Every sales value MUST be written as "SAR <amount>".
 - Numbers ending in "_pct" are percentages.
 
@@ -252,23 +252,19 @@ Now write the answer:
         print(f"[whatif-llm] LLM mentioned units — falling back to deterministic summary. raw={s!r}",
               flush=True)
         return _summarize_whatif_result(result)
-    # Strip stray bullets if the LLM added them despite the prompt — we want
+    # Strip stray bullets if the LLM added them despite the prompt - we want
     # plain prose paragraphs only.
     s = re.sub(r'^\s*[•·\-\*]\s*', '', s, flags=re.MULTILINE)
-    # Require at least 3 paragraphs (i.e., 2 blank-line separators). If the LLM
-    # returned a wall of text or only two paragraphs, fall back to the
-    # deterministic three-paragraph version.
+    # Require at least 3 paragraphs. If the LLM returned a wall of text or only 
+    # two paragraphs, fall back to the deterministic three-paragraph version.
     paragraphs = [p.strip() for p in re.split(r'\n\s*\n', s) if p.strip()]
     if len(paragraphs) < 3:
         print(f"[whatif-llm] LLM returned {len(paragraphs)} paragraph(s); using structured fallback.",
               flush=True)
         return _summarize_whatif_result(result)
-    # Drop any leading meta-explanation sentence. If paragraph 1 starts with
-    # "In this scenario", "We are examining", "Let's analyze", etc., remove just
-    # that opening sentence — keep the rest of the paragraph if there is more.
+    # that opening sentence - keep the rest of the paragraph if there is more.
     paragraphs[0] = _strip_meta_opening(paragraphs[0])
     if not paragraphs[0]:
-        # Whole paragraph 1 was meta — drop it and promote 2 & 3.
         paragraphs = paragraphs[1:]
         if len(paragraphs) < 3:
             return _summarize_whatif_result(result)
@@ -323,8 +319,6 @@ def _looks_like_unit_confusion(text):
     if not text:
         return False
     t = text.lower()
-    # A sentence is suspect if it pairs a sales-related noun with "units" / "items" /
-    # "pieces" — without "SAR" anywhere nearby.
     bad_terms = ['units', 'items sold', 'pieces sold', 'pcs', 'unit sales']
     if any(term in t for term in bad_terms) and 'sar' not in t:
         return True
@@ -334,8 +328,7 @@ def _looks_like_unit_confusion(text):
 def _summarize_whatif_result(result):
     """Code-side three-paragraph fallback. Used when the LLM misbehaves or
     fails to produce the right shape. Mirrors the prompt template in
-    generate_whatif_llm_response above. Edit the f-strings below to change
-    the deterministic answer text."""
+    generate_whatif_llm_response above."""
     name     = result.get('product_name', 'the product')
     scenario = result.get('scenario')
 
@@ -441,24 +434,165 @@ def _summarize_whatif_result(result):
     return "Simulation completed. See the chart for the predicted impact."
 
 
+
+def _product_catalog_text():
+    """Readable list of valid products, e.g. 'Wedding Dress, Graduation Dress, Party Dress'."""
+    return ", ".join(PRODUCT_NAMES.values())
+
+
+def _discount_catalog_text():
+    """Readable list of valid discounts, e.g. '0%, 25%, 35%, 45%'."""
+    return ", ".join(f"{int(round(d * 100))}%" for d in VALID_DISCOUNTS)
+
+
+def _coerce_number(x):
+    """Return x as a number. Accepts ints, floats, and numeric strings such as
+    '0.25', '3', or '10 SAR'. Returns None when there is no number to read —
+    so the caller can treat it as 'missing' instead of crashing."""
+    if x is None or isinstance(x, (int, float)):
+        return x
+    m = re.search(r'-?\d+(?:\.\d+)?', str(x))
+    if not m:
+        return None
+    s = m.group(0)
+    return float(s) if '.' in s else int(s)
+
+
+def _format_discount_value(value):
+    """Show the discount the user asked for in a readable way for error text."""
+    try:
+        pct = value * 100 if value <= 1 else value
+        return f"{pct:g}%"
+    except Exception:
+        return str(value)
+
+
+def _suggest_product_name(user_question):
+    """If the user seems to have mistyped a product name, return the closest
+    valid product name. Returns None when nothing is close enough."""
+    if not user_question:
+        return None
+    text = user_question.lower()
+    valid_names = list(PRODUCT_NAMES.values())
+    # 1) the full product name already appears in the text
+    for name in valid_names:
+        if name.lower() in text:
+            return name
+    # 2) fuzzy-match on the distinguishing word (Wedding / Graduation / Party)
+    key_word = {name.split()[0].lower(): name for name in valid_names}
+    for word in re.findall(r"[a-z]+", text):
+        match = difflib.get_close_matches(word, list(key_word.keys()), n=1, cutoff=0.75)
+        if match:
+            return key_word[match[0]]
+    return None
+
+
 def handle_whatif_question(user_question, client):
     """
     Full what-if execution flow.
-    Returns (text_response, result_dict) so the interface can render the chart.
-    result_dict is None for unknown or failed scenarios.
+    Returns (text_response, result_dict). result_dict is None whenever the
+    scenario could not be run.
+
+    Each failure path returns a SPECIFIC, user-friendly message so the user
+    knows exactly what to fix. Checks run from the most specific case to the
+    most general; the final try/except is a safety net so the bot always
+    replies with something readable instead of crashing.
     """
     params = parse_whatif_parameters(user_question, client)
 
+    # The LLM reply could not be read at all - give a guiding fallback.
     if params is None:
-        return "I could not understand the request. Please specify the product and what you want to change.", None
+        return (
+            "I couldn't read that request. You can ask me to:\n"
+            "1. Raise a price — e.g. \"Raise the Party Dress price by 10 SAR\".\n"
+            "2. Change a discount — e.g. \"Apply 25% discount on the Wedding Dress\".\n"
+            "3. Run a discount over months — e.g. \"Apply 25% discount on the "
+            "Wedding Dress from March to May\".",
+            None,
+        )
 
-    scenario   = params.get('scenario')
-    product_id = params.get('product_id')
-    value      = params.get('value')
+    scenario    = params.get('scenario')
+    product_id  = _coerce_number(params.get('product_id'))
+    value       = _coerce_number(params.get('value'))
+    start_month = _coerce_number(params.get('start_month'))
+    end_month   = _coerce_number(params.get('end_month'))
 
-    if product_id is None or value is None:
-        return "Missing required information. Please include the product and the value.", None
+    # 1) The scenario itself must be recognised.
+    if scenario not in ('price_change', 'discount_change', 'extended_discount'):
+        return (
+            "I couldn't tell what you'd like to simulate. I can do three things:\n"
+            "1. Raise a price (e.g. \"raise the Party Dress price by 10 SAR\").\n"
+            "2. Change a discount (e.g. \"apply 25% discount on the Wedding Dress\").\n"
+            "3. Run a discount across months (e.g. \"apply 25% discount on the "
+            "Wedding Dress from March to May\").",
+            None,
+        )
 
+    # 2) The product must exists.
+    if product_id is None or product_id not in PRODUCT_NAMES:
+        suggestion = _suggest_product_name(user_question)
+        hint = f" Did you mean \"{suggestion}\"?" if suggestion else ""
+        return (
+            f"I couldn't find that product.{hint}\n"
+            f"Please choose one of our products: {_product_catalog_text()}.",
+            None,
+        )
+
+    product_id   = int(product_id)
+    product_name = PRODUCT_NAMES[product_id]
+
+    # 3) A value is required - a SAR amount, or a discount rate.
+    if value is None:
+        if scenario == 'price_change':
+            return (
+                f"How much would you like to raise the {product_name} price by? "
+                "Please give an amount in SAR, e.g. \"by 10 SAR\".",
+                None,
+            )
+        return (
+            f"Which discount would you like to apply to the {product_name}?\n"
+            f"Available discounts: {_discount_catalog_text()}.",
+            None,
+        )
+
+    # 4) Scenario-specific validation - a message tailored to each problem.
+    if scenario == 'price_change':
+        if value <= 0:
+            return (
+                "The price increase has to be a positive amount in SAR, "
+                "e.g. \"raise the price by 10 SAR\".",
+                None,
+            )
+    else:
+        # discount_change and extended_discount both need an allowed discount.
+        if value not in VALID_DISCOUNTS:
+            return (
+                f"{_format_discount_value(value)} is not an available discount "
+                f"for the {product_name}.\n"
+                f"Please pick one of the allowed discounts: {_discount_catalog_text()}.",
+                None,
+            )
+
+    if scenario == 'extended_discount':
+        if start_month is None or end_month is None:
+            return (
+                f"Please tell me the period for the {product_name} discount — "
+                "a start month and an end month, e.g. \"from March to May\".",
+                None,
+            )
+        start_month = int(start_month)
+        end_month   = int(end_month)
+        if not (1 <= start_month <= 12) or not (1 <= end_month <= 12):
+            return ("Please use months between 1 (January) and 12 (December).", None)
+        if start_month > end_month:
+            return (
+                f"The start month ({MONTH_NAMES[start_month]}) comes after the "
+                f"end month ({MONTH_NAMES[end_month]}). Please put the earlier "
+                "month first, e.g. \"from March to May\".",
+                None,
+            )
+
+    # 5) Everything checks out - run the simulation.
     try:
         if scenario == 'price_change':
             baseline, baseline_pred = get_latest_baseline(FIXED_STORE_ID, product_id)
@@ -468,31 +602,31 @@ def handle_whatif_question(user_question, client):
             baseline, baseline_pred = get_latest_baseline(FIXED_STORE_ID, product_id)
             result = whatif_avg_discount(baseline, baseline_pred, value)
 
-        elif scenario == 'extended_discount':
-            start_month = params.get('start_month')
-            end_month   = params.get('end_month')
-            if start_month is None or end_month is None:
-                return "Please specify the start and end month for the extended discount.", None
+        else:  # extended_discount
             result = whatif_extended_discount(
-                store_id    = FIXED_STORE_ID,
-                product_id  = product_id,
-                start_month = start_month,
-                end_month   = end_month,
-                new_discount= value
+                store_id     = FIXED_STORE_ID,
+                product_id   = product_id,
+                start_month  = start_month,
+                end_month    = end_month,
+                new_discount = value,
             )
             if result.get('status') == 'no_data':
-                return result['message'], None
-
-        else:
-            return "This scenario is not supported.", None
+                return (
+                    f"I don't have historical data for the {product_name} in the "
+                    "months you picked, so I can't simulate that period. "
+                    "Try a different month range.",
+                    None,
+                )
 
         text = generate_whatif_llm_response(result, client)
         return text, result
 
+    # Safety net - anything not caught above still gets a readable reply
+    # instead of crashing the chat.
     except ValueError as e:
-        return f"Invalid input: {e}", None
+        return f"I couldn't run that simulation: {e}", None
     except Exception as e:
-        return f"Something went wrong: {e}", None
+        return f"Something went wrong while running the simulation: {e}", None
 
 
 # Statistics RAG Handler

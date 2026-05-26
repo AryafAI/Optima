@@ -3,12 +3,12 @@
 # Store 
 FIXED_STORE_ID = 14
 
-# Products 
-PRODUCT_IDS = [8999, 12717, 10013]
+# Products
+PRODUCT_IDS = [8999, 8973, 10013]
 
 PRODUCT_NAMES = {
     8999:  "Wedding Dress",
-    12717: "Graduation Dress",
+    8973:  "Graduation Dress",
     10013: "Party Dress",
 }
 

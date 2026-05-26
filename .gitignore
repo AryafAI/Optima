@@ -1,33 +1,4 @@
-# Secrets — NEVER commit these
 .env
-.env.local
-.env.*.local
-*.key
-
-# Python
 __pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-venv/
-env/
-ENV/
-.venv/
-*.egg-info/
-.eggs/
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-.DS_Store
-
-# OS
-Thumbs.db
-desktop.ini
-
-# Local data caches (regenerated automatically)
-chroma_db/
-*.log
+*.pyc
+*.pkl

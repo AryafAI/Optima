@@ -33,7 +33,7 @@ Write ONE professional business paragraph using ONLY the provided facts.
 
 Strict rules:
 - Do NOT invent numbers
-- Do NOT change or rename the product name — use it EXACTLY as provided
+- Do NOT change or rename the product name - use it EXACTLY as provided
 - Do NOT add unsupported assumptions
 - Do NOT mention AI, machine learning, code, variables, or technical details
 - Use professional business language

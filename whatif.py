@@ -1,7 +1,7 @@
 # whatif.py - All what-if simulation functions for the Optima DSS
 
 import pandas as pd
-from config import FEATURE_COLS, MONTH_NAMES, VALID_DISCOUNTS, FIXED_STORE_ID
+from config import FEATURE_COLS, MONTH_NAMES, VALID_DISCOUNTS, PRODUCT_NAMES
 from data_loader import load_all
 
 # Load shared resources 
@@ -65,7 +65,7 @@ def get_baseline(store_id, product_id, month, year=None):
 def get_latest_baseline(store_id, product_id):
     """
     Returns the absolute latest row for a product in a store.
-    No month filtering — uses the most recent week available.
+    No month filtering - uses the most recent week available.
     Used by chatbot when user does not specify a month.
     """
     match = train_data[
@@ -127,7 +127,6 @@ def whatif_price_change(baseline, baseline_pred, new_price_increase):
     Automatically recomputes Price_Relative.
     Returns structured result dict.
     """
-    from config import PRODUCT_NAMES
     row            = baseline.copy()
     original_price = row['Avg_Price']
     final_price    = original_price + new_price_increase
@@ -166,7 +165,6 @@ def whatif_avg_discount(baseline, baseline_pred, new_discount):
     Updates Avg_Price and Price_Relative automatically.
     Returns structured result dict.
     """
-    from config import PRODUCT_NAMES
     if new_discount not in VALID_DISCOUNTS:
         raise ValueError(f"Discount must be one of: {VALID_DISCOUNTS}")
 
@@ -209,7 +207,6 @@ def whatif_extended_discount(store_id, product_id, start_month, end_month, new_d
     Simulates running a discount across multiple consecutive months.
     Returns structured result dict with status, message, and monthly breakdown.
     """
-    from config import PRODUCT_NAMES
     if new_discount not in VALID_DISCOUNTS:
         raise ValueError(f"Discount must be one of: {VALID_DISCOUNTS}")
 

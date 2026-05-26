@@ -50,8 +50,31 @@ if os.path.isdir("interface"):
 train_data, model, product_avg_price, pr_min, pr_max = load_all()
 llm_client = create_llm_client(OPENAI_API_KEY)
 
+# Validate that every configured PRODUCT_ID actually has rows for FIXED_STORE_ID
+# in the training data. If a product is missing, what-if scenarios will fail at
+# runtime with "No data found"; surfacing this at startup makes the issue easy
+# to diagnose and fix in config.py.
+print("\nValidating PRODUCT_IDS against training data...")
+for _pid in PRODUCT_IDS:
+    _matching = train_data[
+        (train_data['Store ID']   == FIXED_STORE_ID) &
+        (train_data['Product ID'] == _pid)
+    ]
+    _name = PRODUCT_NAMES.get(_pid, "Unknown")
+    if len(_matching) == 0:
+        print(f"  ⚠ WARNING: Product {_pid} ({_name}) has NO rows in Store "
+              f"{FIXED_STORE_ID}. What-if scenarios for this product will fail. "
+              f"Edit PRODUCT_IDS in config.py to use a product that exists in "
+              f"this store.")
+    else:
+        _months = sorted(_matching['Month'].unique().tolist())
+        _years  = sorted(_matching['Year'].unique().tolist())
+        print(f"  Product {_pid} ({_name}): {len(_matching)} rows in Store "
+              f"{FIXED_STORE_ID}, months {_months}, years {_years}")
+print()
+
 # Load or generate RAG documents.
-# Validate that loaded documents reference the CURRENT PRODUCT_IDS — otherwise
+# Validate that loaded documents reference the CURRENT PRODUCT_IDS - otherwise
 # the RAG retrieval would return stale or empty results for current queries.
 def _docs_match_current_products(metadatas):
     if not metadatas:
@@ -68,13 +91,13 @@ documents, metadatas, ids = [], [], []
 try:
     documents, metadatas, ids = load_documents()
     if _docs_match_current_products(metadatas):
-        print(f"✓ Loaded {len(documents)} documents from backup (matches current products)")
+        print(f"Loaded {len(documents)} documents from backup (matches current products)")
     else:
-        print("⚠ Loaded documents do not cover current PRODUCT_IDS — regenerating...")
+        print("⚠ Loaded documents do not cover current PRODUCT_IDS - regenerating...")
         documents, metadatas, ids = [], [], []
         raise FileNotFoundError
 except FileNotFoundError:
-    print("No usable backup found — generating documents (this calls the LLM, may take ~30s)...")
+    print("No usable backup found - generating documents (this calls the LLM, may take ~30s)...")
     documents, metadatas, ids = generate_documents_with_llm(
         train_data   = train_data,
         store_id     = FIXED_STORE_ID,
@@ -87,7 +110,7 @@ except FileNotFoundError:
         print(f"⚠ Could not save documents backup: {e}")
 
 collection = setup_chromadb(documents, metadatas, ids)
-print(f"✓ ChromaDB ready with {collection.count()} documents")
+print(f"ChromaDB ready with {collection.count()} documents")
 
 # Request Models
 
@@ -143,7 +166,7 @@ def get_overview():
     of training data for the selected products at the fixed store:
         - total_quantity_sold
         - total_sales
-        - total_profit  (sales − production cost*quantity, with a fallback)
+        - total_profit  (sales - production cost*quantity, with a fallback)
         - top_product   (the product with the highest sales over those 4 weeks)
     """
     try:
@@ -163,7 +186,6 @@ def get_overview():
 
         total_sales    = float(latest['Weekly_Sales'].sum())
 
-        # Quantity column is named differently across snapshots — try them in order
         qty_col = next(
             (c for c in ['Quantity', 'Weekly_Quantity', 'Units_Sold', 'Lag1_Quantity']
              if c in latest.columns),
@@ -176,7 +198,7 @@ def get_overview():
             with_price = latest[latest['Avg_Price'] > 0]
             total_quantity = int((with_price['Weekly_Sales'] / with_price['Avg_Price']).sum())
 
-        # Profit = sales − production cost × quantity, where Production Cost is per unit
+        # Profit = sales - production cost × quantity, where Production Cost is per unit
         prod_cost_col = 'Production Cost' if 'Production Cost' in latest.columns else None
         if prod_cost_col and qty_col:
             total_cost   = float((latest[prod_cost_col] * latest[qty_col]).sum())
@@ -188,7 +210,7 @@ def get_overview():
             total_cost   = float((with_price[prod_cost_col] * with_price['_qty']).sum())
             total_profit = total_sales - total_cost
         else:
-            total_profit = total_sales  # production cost not available; show sales as profit floor
+            total_profit = total_sales  
 
         # Top product by total sales over the latest 4 weeks
         per_product = latest.groupby('Product ID')['Weekly_Sales'].sum().sort_values(ascending=False)
