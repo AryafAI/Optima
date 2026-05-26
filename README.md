@@ -27,6 +27,7 @@ Optima/
 
 
 ## Architecture
+```
 
 
 User question
@@ -42,5 +43,6 @@ POST /chat → chatbot.classify_user_query() (LLM)
     │
     └── route = "unknown"        → polite fallback message
 
+```
 
 Built as a graduation project - 2026.
