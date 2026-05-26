@@ -10,6 +10,7 @@ Decision Support System backend for a fashion retail store. Combines:
 ---
 
 ## File overview
+```
 
 Optima/
 ├── api.py              FastAPI endpoints 
@@ -20,6 +21,7 @@ Optima/
 ├── config.py           Constants (product IDs, paths, valid discounts, ...)
 ├── .env.example        fill OPENAI_API_KEY
 └── .gitignore
+```
 
 ---
 
